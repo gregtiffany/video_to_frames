@@ -9,8 +9,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
-from PIL import Image
-
 
 SETTINGS_FILE = "settings.json"
 
