@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-from opencv-python-headless import cv2
+import cv2
 import requests
 from PIL import Image
 
