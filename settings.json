@@ -1,0 +1,17 @@
+{
+  "onevizion": {
+    "base_url": "https://apps2.onevizion.com",
+    "access_key": "gtNxdcELJUjOYPRQwVwO",
+    "secret_key": "p77FJSx2aXy6MPXKrfstEy33dSFMNFKDGgfrqP4DBU93nLa7ZBmY9zDKCRZr9e5YoVRkYO"
+  },
+  "processing": {
+    "trackor_type": "ChecklistItem",
+    "trigger_field": "CHI_PROCESS_FRAMES",
+    "source_video_field": "CHI_VIDEO",
+    "target_frames_field": "CHI_ALL_CHECKLIST_ITEM_PHOTOS",
+    "frame_interval_seconds": 2,
+    "max_image_width": 512,
+    "image_quality": 50,
+    "working_dir": "work"
+  }
+}
