@@ -3,12 +3,11 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-import cv2
 import requests
 from PIL import Image
 
@@ -191,7 +190,6 @@ def download_source_video(session: requests.Session, base_url: str, trackor_id, 
             if chunk:
                 f.write(chunk)
 
-    # Source video field is expected to be a single E-File video, not a Multi E-File ZIP
     if video_path.suffix.lower() == ".zip":
         raise RuntimeError(
             f"Trackor {trackor_id}: source_video_field returned a ZIP archive. "
@@ -200,6 +198,103 @@ def download_source_video(session: requests.Session, base_url: str, trackor_id, 
 
     print(f"Saved source video: {video_path}")
     return video_path
+
+
+def require_binary(binary_name: str):
+    path = shutil.which(binary_name)
+    if not path:
+        raise RuntimeError(
+            f"Required executable '{binary_name}' was not found in PATH. "
+            f"This script requires {binary_name} to be installed in the VizionHub runtime."
+        )
+    return path
+
+
+def get_video_duration_seconds(video_path: Path) -> float:
+    ffprobe_path = require_binary("ffprobe")
+
+    command = [
+        ffprobe_path,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed for {video_path}. "
+            f"Return code: {result.returncode}. stderr: {result.stderr.strip()}"
+        )
+
+    output = (result.stdout or "").strip()
+    if not output:
+        raise RuntimeError(f"ffprobe did not return a duration for {video_path}")
+
+    try:
+        duration = float(output)
+    except ValueError:
+        raise RuntimeError(f"Could not parse video duration from ffprobe output: {output}")
+
+    if duration <= 0:
+        raise RuntimeError(f"Invalid video duration for {video_path}: {duration}")
+
+    return duration
+
+
+def format_timestamp_for_filename(timestamp_seconds: float) -> str:
+    return f"{int(round(timestamp_seconds))}s"
+
+
+def extract_single_frame_with_ffmpeg(video_path: Path, timestamp_seconds: float, raw_output_path: Path):
+    ffmpeg_path = require_binary("ffmpeg")
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-ss", str(timestamp_seconds),
+        "-i", str(video_path),
+        "-frames:v", "1",
+        str(raw_output_path)
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed extracting frame at {timestamp_seconds:.3f}s from {video_path}. "
+            f"Return code: {result.returncode}. stderr: {result.stderr.strip()}"
+        )
+
+    if not raw_output_path.exists() or raw_output_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"ffmpeg reported success but no frame file was created at: {raw_output_path}"
+        )
+
+
+def resize_and_save_jpeg(input_path: Path, output_path: Path, max_width: int, jpeg_quality: int):
+    with Image.open(input_path) as img:
+        img = img.convert("RGB")
+
+        if img.width > max_width:
+            new_height = int(img.height * (max_width / img.width))
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+
+        img.save(output_path, format="JPEG", quality=jpeg_quality, optimize=True)
 
 
 def extract_frames(
@@ -212,57 +307,46 @@ def extract_frames(
 ) -> list[Path]:
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Unable to open video: {video_path}")
+    duration_seconds = get_video_duration_seconds(video_path)
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-    if not fps or fps <= 0:
-        cap.release()
-        raise RuntimeError(
-            f"Could not determine FPS for video: {video_path}. "
-            "FPS is required to capture frames at time intervals."
-        )
-
-    if not frame_count or frame_count <= 0:
-        cap.release()
-        raise RuntimeError(
-            f"Could not determine frame count for video: {video_path}"
-        )
-
-    duration_seconds = frame_count / fps
     timestamps = [0.0]
-
     t = float(interval_seconds)
     while t < duration_seconds:
         timestamps.append(t)
         t += float(interval_seconds)
 
     saved_frames = []
+
     for idx, timestamp in enumerate(timestamps):
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            print(f"Warning: could not read frame at {timestamp:.2f}s for Trackor {trackor_id}")
-            continue
+        raw_frame_path = frames_dir / f"_raw_{idx:04d}.jpg"
+        final_frame_filename = (
+            f"trackor_{trackor_id}_frame_{idx:04d}_{format_timestamp_for_filename(timestamp)}.jpg"
+        )
+        final_frame_path = frames_dir / final_frame_filename
 
-        # Convert BGR -> RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
+        try:
+            extract_single_frame_with_ffmpeg(
+                video_path=video_path,
+                timestamp_seconds=timestamp,
+                raw_output_path=raw_frame_path
+            )
 
-        if img.width > max_width:
-            new_height = int(img.height * (max_width / img.width))
-            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+            resize_and_save_jpeg(
+                input_path=raw_frame_path,
+                output_path=final_frame_path,
+                max_width=max_width,
+                jpeg_quality=jpeg_quality
+            )
 
-        frame_filename = f"trackor_{trackor_id}_frame_{idx:04d}_{int(round(timestamp))}s.jpg"
-        frame_path = frames_dir / frame_filename
+            saved_frames.append(final_frame_path)
+            print(f"Extracted frame {idx:04d} at {timestamp:.2f}s -> {final_frame_filename}")
 
-        img.save(frame_path, format="JPEG", quality=jpeg_quality, optimize=True)
-        saved_frames.append(frame_path)
+        except Exception as e:
+            print(f"Warning: could not extract frame at {timestamp:.2f}s for Trackor {trackor_id}: {e}")
 
-    cap.release()
+        finally:
+            if raw_frame_path.exists():
+                raw_frame_path.unlink(missing_ok=True)
 
     if not saved_frames:
         raise RuntimeError(f"No frames were extracted from {video_path}")
@@ -317,8 +401,6 @@ def reset_trigger_field(
 ):
     url = f"{base_url}/api/v3/trackors/{trackor_id}"
 
-    # Different tenants/wrappers sometimes expect slightly different payload shapes.
-    # We try a few safe variants.
     payload_candidates = [
         {trigger_field: reset_value},
         {"fields": {trigger_field: reset_value}},
@@ -402,7 +484,6 @@ def process_trackor(
                 file_path=frame_path
             )
 
-        # Only reset the trigger AFTER all steps above succeeded
         reset_trigger_field(
             session=session,
             base_url=base_url,
@@ -414,7 +495,6 @@ def process_trackor(
         print(f"Trackor {trackor_id} processed successfully.")
 
     finally:
-        # Keep work directory cleanup deterministic
         if trackor_work_dir.exists():
             shutil.rmtree(trackor_work_dir, ignore_errors=True)
 
@@ -434,6 +514,10 @@ def main():
         trigger_field = pr["trigger_field"]
 
         session = create_session(access_key=access_key, secret_key=secret_key)
+
+        # Fail fast if ffmpeg/ffprobe are not installed
+        require_binary("ffmpeg")
+        require_binary("ffprobe")
 
         trackors = get_trackors(session, base_url, trackor_type, trigger_field)
         print(f"Found {len(trackors)} triggered trackor(s).")
