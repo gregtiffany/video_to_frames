@@ -254,8 +254,19 @@ def format_timestamp_for_filename(timestamp_seconds: float) -> str:
     return f"{int(round(timestamp_seconds))}s"
 
 
-def extract_single_frame_with_ffmpeg(video_path: Path, timestamp_seconds: float, raw_output_path: Path):
+def extract_single_frame_with_ffmpeg(
+    video_path: Path,
+    timestamp_seconds: float,
+    output_path: Path,
+    max_width: int,
+    jpeg_quality: int
+):
     ffmpeg_path = require_binary("ffmpeg")
+
+    # Convert JPEG quality (1–100) to ffmpeg qscale (2–31, lower is better)
+    qscale = max(2, min(31, int((100 - jpeg_quality) / 3)))
+
+    scale_filter = f"scale={max_width}:-1"
 
     command = [
         ffmpeg_path,
@@ -263,7 +274,9 @@ def extract_single_frame_with_ffmpeg(video_path: Path, timestamp_seconds: float,
         "-ss", str(timestamp_seconds),
         "-i", str(video_path),
         "-frames:v", "1",
-        str(raw_output_path)
+        "-vf", scale_filter,
+        "-q:v", str(qscale),
+        str(output_path)
     ]
 
     result = subprocess.run(
@@ -276,14 +289,11 @@ def extract_single_frame_with_ffmpeg(video_path: Path, timestamp_seconds: float,
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"ffmpeg failed extracting frame at {timestamp_seconds:.3f}s from {video_path}. "
-            f"Return code: {result.returncode}. stderr: {result.stderr.strip()}"
+            f"ffmpeg failed at {timestamp_seconds:.2f}s: {result.stderr}"
         )
 
-    if not raw_output_path.exists() or raw_output_path.stat().st_size == 0:
-        raise RuntimeError(
-            f"ffmpeg reported success but no frame file was created at: {raw_output_path}"
-        )
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"No frame created: {output_path}")
 
 
 def resize_and_save_jpeg(input_path: Path, output_path: Path, max_width: int, jpeg_quality: int):
@@ -305,6 +315,7 @@ def extract_frames(
     max_width: int,
     jpeg_quality: int
 ) -> list[Path]:
+
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     duration_seconds = get_video_duration_seconds(video_path)
@@ -318,40 +329,29 @@ def extract_frames(
     saved_frames = []
 
     for idx, timestamp in enumerate(timestamps):
-        raw_frame_path = frames_dir / f"_raw_{idx:04d}.jpg"
-        final_frame_filename = (
-            f"trackor_{trackor_id}_frame_{idx:04d}_{format_timestamp_for_filename(timestamp)}.jpg"
+        frame_filename = (
+            f"trackor_{trackor_id}_frame_{idx:04d}_{int(round(timestamp))}s.jpg"
         )
-        final_frame_path = frames_dir / final_frame_filename
+        frame_path = frames_dir / frame_filename
 
         try:
             extract_single_frame_with_ffmpeg(
                 video_path=video_path,
                 timestamp_seconds=timestamp,
-                raw_output_path=raw_frame_path
-            )
-
-            resize_and_save_jpeg(
-                input_path=raw_frame_path,
-                output_path=final_frame_path,
+                output_path=frame_path,
                 max_width=max_width,
                 jpeg_quality=jpeg_quality
             )
 
-            saved_frames.append(final_frame_path)
-            print(f"Extracted frame {idx:04d} at {timestamp:.2f}s -> {final_frame_filename}")
+            saved_frames.append(frame_path)
+            print(f"Extracted frame {idx} at {timestamp:.2f}s")
 
         except Exception as e:
-            print(f"Warning: could not extract frame at {timestamp:.2f}s for Trackor {trackor_id}: {e}")
-
-        finally:
-            if raw_frame_path.exists():
-                raw_frame_path.unlink(missing_ok=True)
+            print(f"Warning: skipping frame at {timestamp:.2f}s: {e}")
 
     if not saved_frames:
-        raise RuntimeError(f"No frames were extracted from {video_path}")
+        raise RuntimeError(f"No frames extracted from {video_path}")
 
-    print(f"Extracted {len(saved_frames)} frame(s) from Trackor {trackor_id}")
     return saved_frames
 
 
